@@ -18,6 +18,7 @@ import {
 	respondToAgentPermission,
 	type AgentStreamTransport,
 } from "../lib/agent-stream";
+import { cancelAgentStream, sendAgentStreamPrompt } from "../lib/agent-stream/agentStreamClient";
 import type {
 	AgentPermissionResponse,
 	AgentSessionStreamState,
@@ -36,6 +37,10 @@ export interface UseAgentStreamOptions {
 	initialMessages?: StreamMessage[];
 	/** Inject permission responder (tests). */
 	respondPermission?: (response: AgentPermissionResponse) => Promise<void>;
+	/** Inject prompt sender (tests). */
+	sendPromptFn?: (sessionId: string, text: string) => Promise<void>;
+	/** Inject cancel (tests). */
+	cancelFn?: (sessionId: string) => Promise<void>;
 }
 
 export interface UseAgentStreamResult {
@@ -47,13 +52,23 @@ export interface UseAgentStreamResult {
 	/** Apply one or more already-parsed events (bypasses SSE). */
 	pushEvents: (events: AgentStreamEvent[]) => void;
 	respondToPermission: (requestId: string, optionId: string) => Promise<void>;
-	requestCancel: () => void;
+	/** Optimistic cancel UI + daemon cancel request. */
+	requestCancel: () => Promise<void>;
+	/** Send a user prompt; optimistically appends a user bubble. */
+	sendPrompt: (text: string) => Promise<void>;
 	/** Reset timeline + stream state (new turn / session switch). */
 	reset: (messages?: StreamMessage[]) => void;
 }
 
 export function useAgentStream(options: UseAgentStreamOptions): UseAgentStreamResult {
-	const { sessionId, connect = true, initialMessages = [], respondPermission } = options;
+	const {
+		sessionId,
+		connect = true,
+		initialMessages = [],
+		respondPermission,
+		sendPromptFn,
+		cancelFn,
+	} = options;
 	const [messages, setMessages] = useState<StreamMessage[]>(initialMessages);
 	const [stream, setStream] = useState<AgentSessionStreamState>(createAgentSessionStreamState);
 	const [error, setError] = useState("");
@@ -63,6 +78,18 @@ export function useAgentStream(options: UseAgentStreamOptions): UseAgentStreamRe
 	const streamRef = useRef(stream);
 	messagesRef.current = messages;
 	streamRef.current = stream;
+
+	// Reset stream state when the session id changes.
+	const lastSessionId = useRef(sessionId);
+	useEffect(() => {
+		if (lastSessionId.current === sessionId) return;
+		lastSessionId.current = sessionId;
+		messagesRef.current = [];
+		streamRef.current = createAgentSessionStreamState();
+		setMessages([]);
+		setStream(streamRef.current);
+		setError("");
+	}, [sessionId]);
 
 	const applyEvents = useCallback((events: AgentStreamEvent[]) => {
 		let nextMessages = messagesRef.current;
@@ -149,11 +176,55 @@ export function useAgentStream(options: UseAgentStreamOptions): UseAgentStreamRe
 		[sessionId, respondPermission],
 	);
 
-	const requestCancel = useCallback(() => {
+	const requestCancel = useCallback(async () => {
 		const next = requestAgentStreamCancellation(streamRef.current);
 		streamRef.current = next;
 		setStream(next);
-	}, []);
+		if (!sessionId) return;
+		try {
+			if (cancelFn) {
+				await cancelFn(sessionId);
+			} else {
+				await cancelAgentStream(sessionId, fetch, getApiBaseUrl());
+			}
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+		}
+	}, [sessionId, cancelFn]);
+
+	const sendPrompt = useCallback(
+		async (text: string) => {
+			if (!sessionId) throw new Error("No session");
+			const trimmed = text.trim();
+			if (!trimmed) return;
+
+			// Optimistic user bubble so the UI does not wait for the first SSE frame.
+			const userMessage: StreamMessage = {
+				role: "user",
+				content: trimmed,
+				id: `user-${Date.now()}`,
+				timestamp: new Date().toISOString(),
+				partial: false,
+			};
+			const nextMessages = [...messagesRef.current, userMessage];
+			messagesRef.current = nextMessages;
+			setMessages(nextMessages);
+			setError("");
+
+			try {
+				if (sendPromptFn) {
+					await sendPromptFn(sessionId, trimmed);
+				} else {
+					await sendAgentStreamPrompt(sessionId, trimmed, fetch, getApiBaseUrl());
+				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				setError(message);
+				throw err;
+			}
+		},
+		[sessionId, sendPromptFn],
+	);
 
 	const reset = useCallback((seed: StreamMessage[] = []) => {
 		messagesRef.current = seed;
@@ -172,6 +243,7 @@ export function useAgentStream(options: UseAgentStreamOptions): UseAgentStreamRe
 		pushEvents,
 		respondToPermission,
 		requestCancel,
+		sendPrompt,
 		reset,
 	};
 }

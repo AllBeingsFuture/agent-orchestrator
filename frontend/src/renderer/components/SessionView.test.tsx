@@ -92,39 +92,16 @@ const { workspaces, workspaceQueryState, panels, shellTerminalsState } = vi.hois
 	return { workspaces, workspaceQueryState, panels: new Map<string, PanelEntry>(), shellTerminalsState };
 });
 
-// The terminal and inspector body pull in xterm/SSE machinery irrelevant to
-// the split under test. (ShellTopbar is shell-owned on Win/Linux; when the
-// platform hides the shell topbar, SessionView mounts it in-panel.)
+// Conversation surface + inspector body pull in stream/SSE machinery
+// irrelevant to the split under test. (ShellTopbar is shell-owned on Win/Linux;
+// when the platform hides the shell topbar, SessionView mounts it in-panel.)
 vi.mock("./ShellTopbar", () => ({ ShellTopbar: () => null }));
-vi.mock("./CenterPane", () => ({
-	CenterPane: ({
-		session,
-		shellTerminals = [],
-		onSelectShellTerminal,
-		onSelectSessionTerminal,
-		onNewShellTerminal,
-	}: {
-		session?: WorkspaceSession;
-		shellTerminals?: Array<{ handleId: string; title: string }>;
-		onSelectShellTerminal?: (handleId: string) => void;
-		onSelectSessionTerminal?: () => void;
-		onNewShellTerminal?: () => void;
-	}) => (
+vi.mock("./agent-stream/SessionConversationPane", () => ({
+	SessionConversationPane: ({ session }: { session?: WorkspaceSession }) => (
 		<div>
-			terminal center
+			conversation center
 			<div data-testid="session-tab">{session?.title ?? ""}</div>
-			<div data-testid="shell-tabs">{shellTerminals.map((s) => s.title).join(",")}</div>
-			{shellTerminals.map((s) => (
-				<button key={s.handleId} type="button" onClick={() => onSelectShellTerminal?.(s.handleId)}>
-					select {s.title}
-				</button>
-			))}
-			<button type="button" onClick={() => onSelectSessionTerminal?.()}>
-				select agent tab
-			</button>
-			<button type="button" onClick={() => onNewShellTerminal?.()}>
-				new terminal
-			</button>
+			<div data-testid="session-conversation-pane" data-session-id={session?.id} />
 		</div>
 	),
 }));
@@ -351,81 +328,21 @@ describe("SessionView", () => {
 		openShellTerminalMock.mockReset();
 	});
 
-	// Regression: shell terminals are an app-wide list, so without a per-session
-	// filter a shell opened in another session would show up as a tab in this
-	// session's strip. Only this session's shells (not another session's, and no
-	// session-less ones) should reach the terminal pane.
-	it("shows only the current session's shell terminals as tabs", () => {
-		shellTerminalsState.data = [
-			{
-				handleId: "sh-a",
-				sessionId: "sess-1",
-				title: "sess-1-shell",
-				workingDir: "/p",
-				createdAt: "2026-07-24T00:00:00Z",
-			},
-			{
-				handleId: "sh-b",
-				sessionId: "sess-2",
-				title: "sess-2-shell",
-				workingDir: "/q",
-				createdAt: "2026-07-24T00:00:00Z",
-			},
-			{ handleId: "sh-c", title: "loose-shell", workingDir: "/r", createdAt: "2026-07-24T00:00:00Z" },
-		];
+	// Primary center surface is the ACP stream conversation, not mux/tmux tabs.
+	it("mounts the conversation pane for the on-screen session", () => {
 		render(<SessionView sessionId="sess-1" />);
-		const tabs = screen.getByTestId("shell-tabs");
-		expect(tabs).toHaveTextContent("sess-1-shell");
-		expect(tabs).not.toHaveTextContent("sess-2-shell");
-		expect(tabs).not.toHaveTextContent("loose-shell");
-	});
-
-	// The pane shows one terminal at a time, so selecting a shell takes the
-	// agent's terminal off screen while the route still points at this session.
-	// The notification runtime lives outside this subtree and reads the published
-	// kind to decide whether the user can actually see a needs_input prompt.
-	it("publishes which terminal the session pane is showing", () => {
-		shellTerminalsState.data = [
-			{
-				handleId: "sh-a",
-				sessionId: "sess-1",
-				title: "sess-1-shell",
-				workingDir: "/p",
-				createdAt: "2026-07-24T00:00:00Z",
-			},
-		];
-		const view = render(<SessionView sessionId="sess-1" />);
-		expect(useUiStore.getState().visibleTerminalKindBySession["sess-1"]).toBe("worker");
-
-		fireEvent.click(screen.getByRole("button", { name: "select sess-1-shell" }));
-		expect(useUiStore.getState().visibleTerminalKindBySession["sess-1"]).toBe("shell");
-
-		fireEvent.click(screen.getByRole("button", { name: "select agent tab" }));
-		expect(useUiStore.getState().visibleTerminalKindBySession["sess-1"]).toBe("worker");
-
-		// Leaving the session drops the entry rather than leaving a stale "worker"
-		// behind for a pane that is no longer mounted.
-		view.unmount();
-		expect(useUiStore.getState().visibleTerminalKindBySession["sess-1"]).toBeUndefined();
-	});
-
-	// The strip only ever shows the session on screen — pinning another session's
-	// terminal as a tab (and the cross-project picker that did it) is gone (#3208).
-	it("shows only the session on screen in the tab strip", () => {
-		render(<SessionView sessionId="sess-1" />);
-
+		expect(screen.getByTestId("session-conversation-pane")).toHaveAttribute("data-session-id", "sess-1");
 		expect(screen.getByTestId("session-tab")).toHaveTextContent("do the thing");
 		expect(screen.getByTestId("session-tab")).not.toHaveTextContent("do the other thing");
-		expect(screen.queryByRole("button", { name: /^Add / })).not.toBeInTheDocument();
 	});
 
-	// The daemon roots a shell in the session's worktree when it is given that
-	// session's id, so a new terminal must name the session actually on screen.
-	it("opens new terminals in the on-screen session's worktree", () => {
-		render(<SessionView sessionId="sess-2" />);
-
-		fireEvent.click(screen.getByRole("button", { name: "new terminal" }));
-		expect(openShellTerminalMock).toHaveBeenCalledWith({ projectId: "proj-1", sessionId: "sess-2" }, expect.anything());
+	// Notifications treat "worker" as "user is watching this session's agent surface".
+	// Stream conversation is that surface (permission cards replace terminal prompts).
+	it("publishes the session as watched while conversation is mounted", () => {
+		const view = render(<SessionView sessionId="sess-1" />);
+		expect(useUiStore.getState().visibleTerminalKindBySession["sess-1"]).toBe("worker");
+		view.unmount();
+		expect(useUiStore.getState().visibleTerminalKindBySession["sess-1"]).toBeUndefined();
 	});
 
 	// Regression: react-resizable-panels v4 treats bare numeric sizes as PIXELS
@@ -447,7 +364,7 @@ describe("SessionView", () => {
 	it("opens the Summary inspector alongside the terminal by default", () => {
 		render(<SessionView sessionId="sess-1" />);
 
-		expect(screen.getByText("terminal center")).toBeInTheDocument();
+		expect(screen.getByText("conversation center")).toBeInTheDocument();
 		expect(panelSizes("inspector")[0]).toBe("28%");
 		// Open panels are non-collapsible so a drag clamps at minSize instead of
 		// snapping the rail away; only the closed panel is collapsible.
@@ -667,17 +584,17 @@ describe("SessionView", () => {
 		act(() => useUiStore.getState().setInspectorOpen("sess-1", true));
 		render(<SessionView sessionId="sess-1" />);
 
-		expect(screen.getByText("terminal center")).toBeInTheDocument();
+		expect(screen.getByText("conversation center")).toBeInTheDocument();
 		fireEvent.click(screen.getByRole("button", { name: "pop browser" }));
 
 		// The maximized overlay appears; the terminal stays mounted behind it.
 		expect(screen.getByRole("button", { name: "browser center" })).toBeInTheDocument();
 		expect(document.querySelector(".browser-popout-overlay")).toHaveClass("browser-popout-overlay--mac-windowed");
-		expect(screen.getByText("terminal center")).toBeInTheDocument();
+		expect(screen.getByText("conversation center")).toBeInTheDocument();
 
 		fireEvent.click(screen.getByRole("button", { name: "browser center" }));
 		expect(screen.queryByRole("button", { name: "browser center" })).not.toBeInTheDocument();
-		expect(screen.getByText("terminal center")).toBeInTheDocument();
+		expect(screen.getByText("conversation center")).toBeInTheDocument();
 		expect(browserDestroy).not.toHaveBeenCalled();
 	});
 
@@ -713,7 +630,7 @@ describe("SessionView", () => {
 			within(screen.getByTestId("panel-inspector")).getByRole("button", { name: "files rail" }),
 		).toBeInTheDocument();
 		expect(screen.queryByRole("button", { name: "files center" })).not.toBeInTheDocument();
-		expect(screen.getByText("terminal center")).toBeInTheDocument();
+		expect(screen.getByText("conversation center")).toBeInTheDocument();
 	});
 
 	it("maximizes files over the whole app window and returns to the rail", () => {
@@ -727,14 +644,14 @@ describe("SessionView", () => {
 		const overlay = document.querySelector(".files-popout-overlay");
 		expect(overlay).toHaveClass("files-popout-overlay--mac-windowed");
 		expect(overlay?.parentElement).toBe(document.body);
-		expect(screen.getByText("terminal center")).toBeInTheDocument();
+		expect(screen.getByText("conversation center")).toBeInTheDocument();
 
 		fireEvent.click(screen.getByRole("button", { name: "files center" }));
 		expect(screen.queryByRole("button", { name: "files center" })).not.toBeInTheDocument();
 		expect(
 			within(screen.getByTestId("panel-inspector")).getByRole("button", { name: "files rail" }),
 		).toBeInTheDocument();
-		expect(screen.getByText("terminal center")).toBeInTheDocument();
+		expect(screen.getByText("conversation center")).toBeInTheDocument();
 	});
 
 	it("does not reserve the traffic-light band for maximized files during native macOS fullscreen", () => {
@@ -757,7 +674,7 @@ describe("SessionView", () => {
 		rerender(<SessionView sessionId="sess-1" />);
 
 		// Center pane keeps the terminal — the preview must not pop out over it.
-		expect(screen.getByText("terminal center")).toBeInTheDocument();
+		expect(screen.getByText("conversation center")).toBeInTheDocument();
 		expect(screen.queryByRole("button", { name: "browser center" })).not.toBeInTheDocument();
 		// We badge the Browser tab instead of stealing focus: the active view stays
 		// on the default Summary tab and the unseen flag is set.

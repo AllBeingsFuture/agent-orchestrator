@@ -15,7 +15,8 @@ function mockAgentStream(partial: Partial<UseAgentStreamResult> = {}): UseAgentS
 		connection: "idle",
 		pushEvents: vi.fn(),
 		respondToPermission: vi.fn().mockResolvedValue(undefined),
-		requestCancel: vi.fn(),
+		requestCancel: vi.fn().mockResolvedValue(undefined),
+		sendPrompt: vi.fn().mockResolvedValue(undefined),
 		reset: vi.fn(),
 		...partial,
 	};

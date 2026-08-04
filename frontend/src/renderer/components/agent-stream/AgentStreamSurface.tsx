@@ -1,8 +1,9 @@
 /**
- * Minimal container that wires timeline + activity panel to useAgentStream.
- * Not a full chat product surface — enough to render live ACP stream UX.
+ * Stream conversation chrome: timeline + activity + optional composer.
+ * Primary agent UX — not an xterm/tmux attach surface.
  */
 
+import type { ReactNode } from "react";
 import { LoaderCircle } from "lucide-react";
 import { AgentActivityPanel } from "./AgentActivityPanel";
 import { AgentStreamTimeline } from "./AgentStreamTimeline";
@@ -14,9 +15,16 @@ export interface AgentStreamSurfaceProps {
 	className?: string;
 	/** Optional header label */
 	title?: string;
+	/** Composer slot (send prompt). */
+	composer?: ReactNode;
 }
 
-export function AgentStreamSurface({ agentStream, className, title = "Agent stream" }: AgentStreamSurfaceProps) {
+export function AgentStreamSurface({
+	agentStream,
+	className,
+	title = "Agent stream",
+	composer,
+}: AgentStreamSurfaceProps) {
 	const { messages, stream, streaming, error, connection, respondToPermission, requestCancel } = agentStream;
 
 	return (
@@ -37,7 +45,7 @@ export function AgentStreamSurface({ agentStream, className, title = "Agent stre
 					{connection !== "idle" && connection !== "open" ? (
 						<>
 							<span className="text-passive">·</span>
-							<span>{connection}</span>
+							<span className="text-passive">{connection}</span>
 						</>
 					) : null}
 				</div>
@@ -45,7 +53,7 @@ export function AgentStreamSurface({ agentStream, className, title = "Agent stre
 					<button
 						type="button"
 						className="rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-interactive-hover disabled:opacity-50"
-						onClick={requestCancel}
+						onClick={() => void requestCancel()}
 						disabled={stream.phase === "cancelling"}
 					>
 						{stream.phase === "cancelling" ? "Cancelling…" : "Stop"}
@@ -57,16 +65,15 @@ export function AgentStreamSurface({ agentStream, className, title = "Agent stre
 				<AgentStreamTimeline messages={messages} streaming={streaming} />
 			</div>
 
-			{(stream.permission || stream.plan || stream.statusMessage || error) && (
-				<div className="shrink-0 space-y-2 border-t border-border px-4 py-3">
-					{error ? (
-						<p className="text-xs text-destructive" role="alert">
-							{error}
-						</p>
-					) : null}
-					<AgentActivityPanel stream={stream} onPermissionResponse={respondToPermission} />
-				</div>
-			)}
+			<div className="shrink-0 space-y-2 border-t border-border px-4 py-3">
+				{error ? (
+					<p className="text-xs text-destructive" role="alert">
+						{error}
+					</p>
+				) : null}
+				<AgentActivityPanel stream={stream} onPermissionResponse={respondToPermission} />
+				{composer}
+			</div>
 		</section>
 	);
 }

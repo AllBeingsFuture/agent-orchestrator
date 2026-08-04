@@ -1,28 +1,20 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import type { PanelImperativeHandle, PanelSize } from "react-resizable-panels";
 import { BrowserPanelView, useBrowserAnnotationQueue } from "./BrowserPanel";
-import { CenterPane } from "./CenterPane";
+import { SessionConversationPane } from "./agent-stream/SessionConversationPane";
 import { SessionFilesView } from "./SessionFilesView";
 import { SessionInspector } from "./SessionInspector";
 import { ShellTopbar } from "./ShellTopbar";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "./ui/resizable";
-import { useResolvedTheme, useUiStore, type InspectorView } from "../stores/ui-store";
-import { useShell } from "../lib/shell-context";
+import { useUiStore, type InspectorView } from "../stores/ui-store";
 import { useBrowserView } from "../hooks/useBrowserView";
-import {
-	useCloseShellTerminal,
-	useOpenShellTerminal,
-	useRenameShellTerminal,
-	useShellTerminals,
-} from "../hooks/useShellTerminals";
 import { useWorkspaceQuery } from "../hooks/useWorkspaceQuery";
 import { useWindowFullScreen } from "../hooks/useWindowFullScreen";
 import { hidesShellTopbar } from "../lib/platform";
 import { cn } from "../lib/utils";
 import { isOrchestratorSession, sessionIsActive } from "../types/workspace";
-import type { TerminalTarget } from "../types/terminal";
 import { matchesRendererShortcut } from "../stores/keybindings-store";
 
 const INSPECTOR_MIN_PERCENT = 22;
@@ -48,12 +40,9 @@ type SessionViewProps = {
 	sessionId: string;
 };
 
-// The session detail screen: terminal + git rail. On Win/Linux the shell owns
-// ShellTopbar above this view; when the platform hides the shell topbar
-// (macOS), the same topbar mounts here so the outer panel stays full-height.
-// Rendered by both the project-scoped and cross-project session routes.
-// TerminalPane owns the terminal lifetime and remounts by terminal handle so
-// each session gets a clean xterm/mux binding.
+// The session detail screen: ACP stream conversation + git rail.
+// Agent output is read from sequenced agent-stream events — not xterm attached
+// to a tmux/mux PTY. Optional standalone shells live on /terminals, not here.
 //
 // The split is shadcn's resizable (react-resizable-panels v4) with a fully
 // collapsible inspector driven to 0% via the imperative API from the ui-store
@@ -68,7 +57,6 @@ export function SessionView({ sessionId }: SessionViewProps) {
 	const { t } = useTranslation();
 	const workspaceQuery = useWorkspaceQuery();
 	const workspaces = workspaceQuery.data ?? [];
-	const theme = useResolvedTheme();
 	const isInspectorOpen = useUiStore((state) => state.inspectorSessions[sessionId]?.isOpen ?? true);
 	const inspectorView = useUiStore((state) => state.inspectorSessions[sessionId]?.view ?? "summary");
 	const setInspectorOpenForSession = useUiStore((state) => state.setInspectorOpen);
@@ -76,108 +64,23 @@ export function SessionView({ sessionId }: SessionViewProps) {
 	const setInspectorViewForSession = useUiStore((state) => state.setInspectorView);
 	const markInspectorPreviewSeen = useUiStore((state) => state.markInspectorPreviewSeen);
 	const setBrowserUnseen = useUiStore((state) => state.setBrowserUnseen);
-	const { daemonStatus } = useShell();
 	const inspectorRef = useRef<PanelImperativeHandle | null>(null);
 	const inspectorSeparatorRef = useRef<HTMLDivElement | null>(null);
-	const [terminalTarget, setTerminalTarget] = useState<TerminalTarget>({ kind: "worker" });
 	const [browserPoppedOut, setBrowserPoppedOut] = useState(false);
 	const [filesPoppedOut, setFilesPoppedOut] = useState(false);
 	const isNativeFullScreen = useWindowFullScreen();
 
 	const session = workspaces.flatMap((workspace) => workspace.sessions).find((s) => s.id === sessionId);
 
-	// Shell terminals opened inside a session live beside its pane as extra tabs,
-	// scoped to the session on screen so each session has its own shell set.
-	const allShellTerminals = useShellTerminals().data ?? [];
-	const shellTerminals = useMemo(
-		() => allShellTerminals.filter((shell) => shell.sessionId === sessionId),
-		[allShellTerminals, sessionId],
-	);
-	const openShellTerminal = useOpenShellTerminal();
-	const closeShellTerminal = useCloseShellTerminal();
-	const renameShellTerminal = useRenameShellTerminal();
-	const activeShellTerminalHandleId = useUiStore((state) => state.activeShellTerminalHandleId);
-	const setActiveShellTerminal = useUiStore((state) => state.setActiveShellTerminal);
+	// "worker" here means the user is watching this session's agent surface
+	// (stream conversation). Notifications use the kind to suppress needs_input
+	// toasts when the prompt is already on screen — stream UX includes permission
+	// cards, so the same contract applies without a terminal attach.
 	const setVisibleTerminalKind = useUiStore((state) => state.setVisibleTerminalKind);
 	const clearVisibleTerminalKind = useUiStore((state) => state.clearVisibleTerminalKind);
-	const renameShellTerminalByHandle = useCallback(
-		(handleId: string, title: string) => renameShellTerminal.mutate({ handleId, title }),
-		[renameShellTerminal],
-	);
 
-	// Scoped to the session on screen so the daemon roots the shell in that
-	// session's worktree (the project id is only the fallback when the session's
-	// workspace can no longer be resolved).
-	const addShellTerminal = useCallback(() => {
-		openShellTerminal.mutate(
-			{ projectId: session?.workspaceId, sessionId },
-			{
-				onSuccess: (shell) => {
-					setActiveShellTerminal(shell.handleId);
-					setTerminalTarget({ kind: "shell", handleId: shell.handleId, title: shell.title });
-				},
-			},
-		);
-	}, [openShellTerminal, sessionId, session?.workspaceId, setActiveShellTerminal]);
-
-	const selectShellTerminal = useCallback(
-		(handleId: string) => {
-			const shell = shellTerminals.find((s) => s.handleId === handleId);
-			if (!shell) return;
-			setActiveShellTerminal(shell.handleId);
-			setTerminalTarget({ kind: "shell", handleId: shell.handleId, title: shell.title });
-		},
-		[shellTerminals, setActiveShellTerminal],
-	);
-
-	const closeShellTerminalByHandle = useCallback(
-		(handleId: string) => {
-			// Fall back to the session pane first: leaving the target pointed at a
-			// handle that is being destroyed would attach to a dead PTY.
-			setTerminalTarget((current) =>
-				current.kind === "shell" && current.handleId === handleId ? { kind: "worker" } : current,
-			);
-			if (activeShellTerminalHandleId === handleId) setActiveShellTerminal(null);
-			closeShellTerminal.mutate(handleId);
-		},
-		[closeShellTerminal, activeShellTerminalHandleId, setActiveShellTerminal],
-	);
-
-	// Selecting the session's own pane also drops the active shell, so the effect
-	// above does not immediately pull the view back to that shell.
-	const selectSessionTerminal = useCallback(() => {
-		setActiveShellTerminal(null);
-		setTerminalTarget({ kind: "worker" });
-	}, [setActiveShellTerminal]);
-
-	// The shell layout owns opening (it is mounted on every route, so the button
-	// and ⌘T / Ctrl+T work everywhere); this view only follows the result. When a new
-	// shell becomes active while a session is on screen, switch the pane to it —
-	// that is what makes the shortcut feel like it opened a terminal *here*.
-	useEffect(() => {
-		if (!activeShellTerminalHandleId) return;
-		const shell = shellTerminals.find((s) => s.handleId === activeShellTerminalHandleId);
-		if (!shell) return;
-		setTerminalTarget((current) =>
-			current.kind === "shell" && current.handleId === shell.handleId
-				? current
-				: { kind: "shell", handleId: shell.handleId, title: shell.title },
-		);
-	}, [activeShellTerminalHandleId, shellTerminals]);
-
-	// If the pane is pointed at a shell that is not in THIS session's strip — e.g.
-	// after navigating to a different session whose globally-active shell belongs
-	// elsewhere — fall back to the session's own pane rather than render a tab
-	// that isn't shown here.
-	useEffect(() => {
-		setTerminalTarget((current) =>
-			current.kind === "shell" && !shellTerminals.some((s) => s.handleId === current.handleId)
-				? { kind: "worker" }
-				: current,
-		);
-	}, [shellTerminals]);
 	const isOrchestrator = session ? isOrchestratorSession(session) : false;
-	// Orchestrator sessions are terminal-only; only worker sessions have the rail.
+	// Orchestrator sessions are conversation-only; only worker sessions have the rail.
 	const hasInspector = Boolean(session && !isOrchestrator);
 	const previewUrl = session?.previewUrl?.trim() || undefined;
 	const previewRevision = session?.previewRevision;
@@ -198,20 +101,14 @@ export function SessionView({ sessionId }: SessionViewProps) {
 	});
 
 	useLayoutEffect(() => {
-		setTerminalTarget({ kind: "worker" });
 		setBrowserPoppedOut(false);
 		setFilesPoppedOut(false);
 	}, [sessionId]);
 
-	// The pane shows one terminal at a time, so selecting a shell or the reviewer
-	// takes the agent's terminal off screen while the route still points here.
-	// Publish which one is showing: the notification runtime lives outside this
-	// subtree and must not treat "on the session route" as "watching the agent".
 	useEffect(() => {
-		setVisibleTerminalKind(sessionId, terminalTarget.kind);
+		setVisibleTerminalKind(sessionId, "worker");
 		return () => clearVisibleTerminalKind(sessionId);
-	}, [clearVisibleTerminalKind, sessionId, setVisibleTerminalKind, terminalTarget.kind]);
-
+	}, [clearVisibleTerminalKind, sessionId, setVisibleTerminalKind]);
 	const handleOpenFiles = useCallback(() => {
 		setBrowserPoppedOut(false);
 		setFilesPoppedOut(false);
@@ -392,20 +289,16 @@ export function SessionView({ sessionId }: SessionViewProps) {
 				{/* react-resizable-panels v4: bare numbers are PIXELS; percentages must
             be strings. Numeric sizes here once clamped the inspector to 45px. */}
 				<ResizablePanel defaultSize="72%" id="terminal" minSize="45%">
-					<CenterPane
-						daemonReady={daemonStatus.state === "ready"}
-						onCloseShellTerminal={closeShellTerminalByHandle}
-						onNewShellTerminal={addShellTerminal}
-						onRenameShellTerminal={renameShellTerminalByHandle}
-						onSelectSessionTerminal={selectSessionTerminal}
-						onSelectShellTerminal={selectShellTerminal}
-						onSelectWorkerTerminal={selectSessionTerminal}
-						session={session}
-						shellTerminals={shellTerminals}
-						terminalTarget={terminalTarget}
-						theme={theme}
-						topbarActions={<ShellTopbar embedded />}
-					/>
+					{session ? (
+						<SessionConversationPane
+							session={session}
+							topbarActions={<ShellTopbar embedded />}
+						/>
+					) : (
+						<div className="grid h-full place-items-center p-6 text-center font-mono text-xs text-passive">
+							{workspaceQuery.isLoading ? t("session.loading", { defaultValue: "Loading…" }) : t("session.notFound")}
+						</div>
+					)}
 				</ResizablePanel>
 				{hasInspector ? (
 					<>
@@ -438,9 +331,9 @@ export function SessionView({ sessionId }: SessionViewProps) {
 									}
 									isInspectorVisible={isInspectorOpen}
 									onOpenFiles={handleOpenFiles}
-									onOpenReviewerTerminal={({ handleId, harness }) =>
-										setTerminalTarget({ kind: "reviewer", handleId, harness })
-									}
+									// Reviewer output will follow agent-stream; do not attach mux/xterm
+									// as the session center. Trigger still runs on the daemon.
+									onOpenReviewerTerminal={undefined}
 									onToggleBrowserPopOut={handleToggleBrowserPopOut}
 									onViewChange={(next: InspectorView) => setInspectorViewForSession(sessionId, next)}
 									view={inspectorView}

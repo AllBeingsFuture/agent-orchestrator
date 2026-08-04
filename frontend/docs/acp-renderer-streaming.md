@@ -73,18 +73,33 @@ Cancellation continues through existing session stop / interrupt APIs once wired
 
 High-frequency events (`text_delta`, progressive `thinking_update`, in-progress `tool_update`) are coalesced per animation frame (`createAgentStreamBatcher`) so React does not re-render on every token. Terminal events flush immediately.
 
-## UI surface
+## UI surface (primary session center)
 
-Minimal AO-styled components (not a wholesale ABF ConversationView port):
+**Human decision:** demote agent tmux/xterm attach. The session center pane is the
+stream conversation, not `/mux` + xterm.
 
+- `SessionConversationPane` — mounted by `SessionView` as the primary center
+- `AgentStreamSurface` — header + timeline + activity + composer
 - `AgentStreamTimeline` — text / thinking / tool cards
 - `AgentActivityPanel` — plan + permission
-- `AgentStreamSurface` — header + timeline + activity
-- `useAgentStream` — batcher + optional SSE + permission POST
+- `AgentStreamComposer` — user prompt
+- `useAgentStream` — batcher + SSE + prompt/cancel/permission
+
+Agent terminal tabs and mux attach are **not** used to read agent output after
+cutover. Standalone user shells (if any) belong on `/terminals` and must not use
+tmux long-term; they are not the session primary surface.
 
 ## Backend status
 
-As of this frontend PR, the provisional routes above are **not** present on `main` OpenAPI. The pure reducer, batcher, parser, and UI work offline via `pushEvents`. Live SSE stays `connection: unavailable` until the daemon implements the contract.
+As of this frontend PR, the provisional routes above are **not** present on `main` OpenAPI:
+
+1. `GET /api/v1/sessions/{sessionId}/agent-stream` — SSE
+2. `POST .../agent-stream/prompt` — body `{ text }`
+3. `POST .../agent-stream/cancel`
+4. `POST .../agent-stream/permissions/{requestId}` — body `{ optionId }`
+
+The pure reducer, batcher, parser, and UI work offline via `pushEvents`. Live SSE
+stays `connection: unavailable` until the daemon implements the contract.
 
 ## Clean-room / dependency note
 
